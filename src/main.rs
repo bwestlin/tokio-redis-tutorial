@@ -4,14 +4,25 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 
-type Db = Arc<Mutex<HashMap<String, Bytes>>>;
+type ShardedDb = Arc<Vec<Mutex<HashMap<String, Bytes>>>>;
+const N_SHARDS: usize = 10;
+
+fn mk_sharded_db() -> ShardedDb {
+    Arc::new({
+        let mut shards = Vec::with_capacity(N_SHARDS);
+        for _ in 0..N_SHARDS {
+            shards.push(Mutex::new(HashMap::new()));
+        }
+        shards
+    })
+}
 
 #[tokio::main]
 async fn main() {
     // Bind the listener to the address
     let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
 
-    let db = Arc::new(Mutex::new(HashMap::new()));
+    let db = mk_sharded_db();
 
     loop {
         // The second item contains the IP and port of the new connection.
@@ -28,7 +39,16 @@ async fn main() {
     }
 }
 
-async fn process(socket: TcpStream, db: Db) {
+fn hash(key: &str) -> usize {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish() as usize
+}
+
+async fn process(socket: TcpStream, db: ShardedDb) {
     use mini_redis::Command::{self, Get, Set};
 
     // Connection, provided by `mini-redis`, handles parsing frames from
@@ -40,14 +60,18 @@ async fn process(socket: TcpStream, db: Db) {
         println!("GOT: {:?}", frame);
         let response = match Command::from_frame(frame).unwrap() {
             Set(cmd) => {
-                let mut db = db.lock().unwrap();
+                let key = cmd.key();
+                let value = cmd.value();
+                let mut shard = db[hash(key) % db.len()].lock().unwrap();
 
-                db.insert(cmd.key().to_string(), cmd.value().clone());
+                shard.insert(key.to_string(), value.clone());
                 Frame::Simple("OK".to_string())
             }
             Get(cmd) => {
-                let db = db.lock().unwrap();
-                if let Some(value) = db.get(cmd.key()) {
+                let key = cmd.key();
+                let shard = db[hash(key) % db.len()].lock().unwrap();
+
+                if let Some(value) = shard.get(&key.to_string()) {
                     // `Frame::Bulk` expects data to be of type `Bytes`. This
                     // type will be covered later in the tutorial. For now,
                     // `&Vec<u8>` is converted to `Bytes` using `into()`.
